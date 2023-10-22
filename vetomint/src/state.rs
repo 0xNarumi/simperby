@@ -128,3 +128,77 @@ impl ConsensusState {
             .sum()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_default_consensus_state() -> ConsensusState {
+        let height_info = HeightInfo {
+            validators: vec![1, 1, 1, 1],
+            this_node_index: Some(0),
+            timestamp: 0,
+            consensus_params: ConsensusParams {
+                timeout_ms: 100,
+                repeat_round_for_first_leader: 1,
+            },
+            initial_block_candidate: 0,
+        };
+        ConsensusState::new(height_info)
+    }
+
+    #[test]
+    fn get_total_voting_power() {
+        let consensus_state = create_default_consensus_state();
+        assert_eq!(consensus_state.get_total_voting_power(), 4);
+    }
+
+    #[test]
+    fn get_total_prevotes() {
+        // TODO
+    }
+
+    #[test]
+    fn get_total_precommits() {
+        let mut consensus_state = create_default_consensus_state();
+        consensus_state.precommits.insert(Vote {
+            proposal: None,
+            signer: 0,
+            round: 0,
+        });
+        consensus_state.precommits.insert(Vote {
+            proposal: None,
+            signer: 1,
+            round: 0,
+        });
+        consensus_state.precommits.insert(Vote {
+            proposal: None,
+            signer: 2,
+            round: 1,
+        });
+
+        let total_precommits = consensus_state.get_total_precommits(0);
+
+        assert_eq!(total_precommits, 2, "total precommits should be 2");
+    }
+
+    #[test]
+    fn get_total_prevotes_on_proposal() {
+        // TODO: modify the default consensus state (e.g., add prevotes) to test this.
+    }
+
+    #[test]
+    fn get_total_precommits_on_proposal() {
+        // TODO: modify the default consensus state (e.g., add precommits) to test this.
+    }
+
+    #[test]
+    fn get_total_prevotes_on_nil() {
+        // TODO: modify the default consensus state (e.g., add prevotes) to test this.
+    }
+
+    #[test]
+    fn get_total_precommits_on_nil() {
+        // TODO: modify the default consensus state (e.g., add precommits) to test this.
+    }
+}

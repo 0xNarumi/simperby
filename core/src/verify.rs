@@ -176,15 +176,75 @@ impl CommitSequenceVerifier {
     }
 
     /// Verifies whether the given reserved state is valid from the current state.
-    pub fn verify_reserved_state(&self, _rs: &ReservedState) -> Result<(), Error> {
-        // TODO:
-        // 1. Check that the number of members is at least 4.
-        // 2. Check that the version advances correctly.
-        // 3. Check that `consensus_leader_order` is correct.
-        // 4. Check that `genesis_info` stays the same.
-        // 5. Check that the newly added (if exists) `Member::name` is unique.
-        // 6. Check that `member` monotonicaly increases (refer to `Member::expelled`).
-        // 7. Check that the delegation state doesn't change.
+    pub fn verify_reserved_state(&self, rs: &ReservedState) -> Result<(), Error> {
+        // Check that the number of members is at least 4.
+        if rs.members.len() < 4 {
+            return Err(Error::InvalidArgument(
+                "the number of members is less than 4".to_string(),
+            ));
+        }
+        // Check that `consensus_leader_order` is correct.
+        // 1. consensus_leader_order should be the subset of members.
+        // 2. every consensus leader should not be expelled.
+        // 3. consensus_leader_order should consist of more than 1 unique members to avoid a SPoF.
+        let valid_leader_candidates: HashSet<&MemberName> = rs
+            .members
+            .iter()
+            .filter(|m| !m.expelled)
+            .map(|m| &m.name)
+            .collect();
+        if !rs
+            .consensus_leader_order
+            .iter()
+            .all(|m| valid_leader_candidates.contains(m))
+        {
+            return Err(Error::InvalidArgument(
+                "Some consensus leaders are not valid candidates".to_string(),
+            ));
+        }
+        if rs
+            .consensus_leader_order
+            .iter()
+            .collect::<HashSet<&MemberName>>()
+            .len()
+            <= 1
+        {
+            return Err(Error::InvalidArgument(
+                "consensus_leader_order should consist of more than 1 unique members".to_string(),
+            ));
+        }
+        // Check that `genesis_info` stays the same.
+        if rs.genesis_info != self.reserved_state.genesis_info {
+            return Err(Error::InvalidArgument("genesis_info changes".to_string()));
+        }
+        // Check that `Member::name` and `Member::public_key` are unique.
+        let mut member_names = HashSet::new();
+        let mut public_keys = HashSet::new();
+        for member in &rs.members {
+            if !member_names.insert(&member.name) {
+                return Err(Error::InvalidArgument(format!(
+                    "member name '{}' already exists",
+                    member.name
+                )));
+            }
+            if !public_keys.insert(&member.public_key) {
+                return Err(Error::InvalidArgument(format!(
+                    "the public key of '{}' already exists",
+                    member.name
+                )));
+            }
+        }
+        // Check that `member` monotonically increases (refer to `Member::expelled`).
+        // Once a member is added, it cannot be removed, even if it is expelled.
+        let member_names: HashSet<String> = rs.members.iter().map(|m| m.name.clone()).collect();
+        for existing_member in &self.reserved_state.members {
+            if !member_names.contains(&existing_member.name) {
+                return Err(Error::InvalidArgument(format!(
+                    "{} doesn't not exist in members",
+                    &existing_member.name
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -236,6 +296,10 @@ impl CommitSequenceVerifier {
             (Commit::Transaction(tx), Phase::Block) => {
                 // Update reserved_state for reserved-diff transactions.
                 if let Diff::Reserved(rs) = &tx.diff {
+                    self.verify_reserved_state(rs)?;
+                    self.reserved_state = *rs.clone();
+                } else if let Diff::General(rs, _) = &tx.diff {
+                    self.verify_reserved_state(rs)?;
                     self.reserved_state = *rs.clone();
                 }
                 self.phase = Phase::Transaction {
@@ -259,6 +323,10 @@ impl CommitSequenceVerifier {
                 }
                 // Update reserved_state for reserved-diff transactions.
                 if let Diff::Reserved(rs) = &tx.diff {
+                    self.verify_reserved_state(rs)?;
+                    self.reserved_state = *rs.clone();
+                } else if let Diff::General(rs, _) = &tx.diff {
+                    self.verify_reserved_state(rs)?;
                     self.reserved_state = *rs.clone();
                 }
                 let mut preceding_transactions = preceding_transactions.clone();
@@ -526,6 +594,7 @@ mod test {
                 consensus_voting_power: *voting_power,
                 governance_delegatee: None,
                 consensus_delegatee: None,
+                expelled: false,
             });
         }
         members
@@ -570,21 +639,21 @@ mod test {
         }
     }
 
-    fn generate_empty_transaction_commit() -> Commit {
+    fn generate_empty_transaction_commit(time: Timestamp) -> Commit {
         Commit::Transaction(Transaction {
             author: "doesn't matter".to_owned(),
-            timestamp: 0,
+            timestamp: time,
             head: "Test empty commit".to_string(),
             body: "This is important!".to_string(),
             diff: Diff::None,
         })
     }
 
-    fn generate_general_diff_transaction_commit() -> Commit {
+    fn generate_non_reserved_diff_transaction_commit(time: Timestamp) -> Commit {
         Commit::Transaction(Transaction {
             author: "doesn't matter".to_owned(),
-            timestamp: 0,
-            head: "Test general-diff commit".to_string(),
+            timestamp: time,
+            head: "Test non-reserved-diff commit".to_string(),
             body: serde_spb::to_string(&json!({
                 "type": "transfer-ft",
                 "asset": "ETH",
@@ -599,21 +668,22 @@ mod test {
     fn generate_reserved_diff_transaction_commit(
         validator_keypair: &mut Vec<(PublicKey, PrivateKey)>,
         reserved_state: &mut ReservedState,
+        seed: u8,
         time: Timestamp,
     ) -> Commit {
         // Update reserved reserved_state
-        validator_keypair.push(generate_keypair([3]));
+        validator_keypair.push(generate_keypair([seed]));
+        let new_member_name = format!("member{}", validator_keypair.len() - 1);
         reserved_state.members.push(Member {
             public_key: validator_keypair.last().unwrap().0.clone(),
-            name: format!("member{}", validator_keypair.len()),
+            name: new_member_name.clone(),
             governance_voting_power: 1,
             consensus_voting_power: 1,
             governance_delegatee: None,
             consensus_delegatee: None,
+            expelled: false,
         });
-        reserved_state
-            .consensus_leader_order
-            .push("Dave".to_string());
+        reserved_state.consensus_leader_order.push(new_member_name);
         reserved_state.consensus_leader_order.sort();
         Commit::Transaction(Transaction {
             author: "doesn't matter".to_owned(),
@@ -621,6 +691,44 @@ mod test {
             head: "Test reserved-diff commit".to_string(),
             body: String::new(),
             diff: Diff::Reserved(Box::new(reserved_state.clone())),
+        })
+    }
+
+    fn genearte_general_diff_transaction_commit(
+        validator_keypair: &mut Vec<(PublicKey, PrivateKey)>,
+        reserved_state: &mut ReservedState,
+        seed: u8,
+        time: Timestamp,
+    ) -> Commit {
+        // Update reserved reserved_state
+        validator_keypair.push(generate_keypair([seed]));
+        let new_member_name = format!("member{}", validator_keypair.len() - 1);
+        reserved_state.members.push(Member {
+            public_key: validator_keypair.last().unwrap().0.clone(),
+            name: new_member_name.clone(),
+            governance_voting_power: 1,
+            consensus_voting_power: 1,
+            governance_delegatee: None,
+            consensus_delegatee: None,
+            expelled: false,
+        });
+        reserved_state.consensus_leader_order.push(new_member_name);
+        reserved_state.consensus_leader_order.sort();
+        Commit::Transaction(Transaction {
+            author: "doesn't matter".to_owned(),
+            timestamp: time,
+            head: "Test non-reserved-diff commit".to_string(),
+            body: serde_spb::to_string(&json!({
+                "type": "transfer-ft",
+                "asset": "ETH",
+                "amount": "0.1",
+                "recipient": "<key:some-addr-in-ethereum>",
+            }))
+            .unwrap(),
+            diff: Diff::General(
+                Box::new(reserved_state.clone()),
+                Hash256::hash("The actual content of the diff".as_bytes()),
+            ),
         })
     }
 
@@ -645,11 +753,21 @@ mod test {
         })
     }
 
-    fn generate_extra_agenda_transaction(
+    fn generate_delegation_transaction_commit(
         data: &DelegationTransactionData,
         proof: TypedSignature<DelegationTransactionData>,
     ) -> Commit {
         Commit::ExtraAgendaTransaction(ExtraAgendaTransaction::Delegate(TxDelegate {
+            data: data.clone(),
+            proof,
+        }))
+    }
+
+    fn generate_undelegation_transaction_commit(
+        data: &UndelegationTransactionData,
+        proof: TypedSignature<UndelegationTransactionData>,
+    ) -> Commit {
+        Commit::ExtraAgendaTransaction(ExtraAgendaTransaction::Undelegate(TxUndelegate {
             data: data.clone(),
             proof,
         }))
@@ -751,23 +869,32 @@ mod test {
     fn correct_commit_sequence1() {
         let (mut validator_keypair, mut reserved_state, mut csv) = setup_test(4);
         // Apply empty transaction commit
-        csv.apply_commit(&generate_empty_transaction_commit())
+        csv.apply_commit(&generate_empty_transaction_commit(1))
             .unwrap();
-        // Apply general-diff commit
-        csv.apply_commit(&generate_general_diff_transaction_commit())
+        // Apply non-reserved-diff commit
+        csv.apply_commit(&generate_non_reserved_diff_transaction_commit(2))
             .unwrap();
         // Apply reserved-diff commit
         csv.apply_commit(&generate_reserved_diff_transaction_commit(
             &mut validator_keypair,
             &mut reserved_state,
+            4,
             3,
+        ))
+        .unwrap();
+        // Apply general-diff commit
+        csv.apply_commit(&genearte_general_diff_transaction_commit(
+            &mut validator_keypair,
+            &mut reserved_state,
+            5,
+            4,
         ))
         .unwrap();
         // Apply agenda commit
         let agenda_transactions_hash = calculate_agenda_transactions_hash(csv.phase.clone());
         let agenda: Agenda = Agenda {
             author: reserved_state.query_name(&validator_keypair[0].0).unwrap(),
-            timestamp: 4,
+            timestamp: 5,
             transactions_hash: agenda_transactions_hash,
             height: csv.header.height + 1,
             previous_block_hash: csv.header.to_hash256(),
@@ -1141,7 +1268,7 @@ mod test {
     fn phase_mismatch_for_block_commit2() {
         let (validator_keypair, _, mut csv) = setup_test(4);
         // Apply empty transaction commit
-        csv.apply_commit(&generate_empty_transaction_commit())
+        csv.apply_commit(&generate_empty_transaction_commit(1))
             .unwrap();
         // Apply block commit at transaction phase
         csv.apply_commit(&generate_block_commit(
@@ -1160,23 +1287,32 @@ mod test {
     fn phase_mismatch_for_block_commit3() {
         let (mut validator_keypair, mut reserved_state, mut csv) = setup_test(4);
         // Apply empty transaction commit
-        csv.apply_commit(&generate_empty_transaction_commit())
+        csv.apply_commit(&generate_empty_transaction_commit(1))
             .unwrap();
-        // Apply general-diff commit
-        csv.apply_commit(&generate_general_diff_transaction_commit())
+        // Apply non-reserved-diff commit
+        csv.apply_commit(&generate_non_reserved_diff_transaction_commit(2))
             .unwrap();
         // Apply reserved-diff commit
         csv.apply_commit(&generate_reserved_diff_transaction_commit(
             &mut validator_keypair,
             &mut reserved_state,
+            4,
             3,
+        ))
+        .unwrap();
+        // Apply general-diff commit
+        csv.apply_commit(&genearte_general_diff_transaction_commit(
+            &mut validator_keypair,
+            &mut reserved_state,
+            5,
+            4,
         ))
         .unwrap();
         // Apply agenda commit
         let agenda_transactions_hash = calculate_agenda_transactions_hash(csv.phase.clone());
         let agenda: Agenda = Agenda {
             author: reserved_state.query_name(&validator_keypair[0].0).unwrap(),
-            timestamp: 4,
+            timestamp: 5,
             transactions_hash: agenda_transactions_hash,
             height: csv.header.height + 1,
             previous_block_hash: csv.header.to_hash256(),
@@ -1209,7 +1345,7 @@ mod test {
         };
         csv.apply_commit(&generate_agenda_commit(&agenda)).unwrap();
         // Apply transaction commit at agenda phase
-        csv.apply_commit(&generate_empty_transaction_commit())
+        csv.apply_commit(&generate_empty_transaction_commit(2))
             .unwrap_err();
     }
 
@@ -1235,7 +1371,7 @@ mod test {
         ))
         .unwrap();
         // Apply transaction commit at agenda proof phase
-        csv.apply_commit(&generate_empty_transaction_commit())
+        csv.apply_commit(&generate_empty_transaction_commit(2))
             .unwrap_err();
     }
 
@@ -1277,13 +1413,13 @@ mod test {
         };
         let proof =
             TypedSignature::sign(&delegation_transaction_data, &delegator_private_key).unwrap();
-        csv.apply_commit(&generate_extra_agenda_transaction(
+        csv.apply_commit(&generate_delegation_transaction_commit(
             &delegation_transaction_data,
             proof,
         ))
         .unwrap();
         // Apply transaction commit at extra-agenda transaction phase
-        csv.apply_commit(&generate_empty_transaction_commit())
+        csv.apply_commit(&generate_empty_transaction_commit(3))
             .unwrap_err();
     }
 
@@ -1311,7 +1447,7 @@ mod test {
         let (validator_keypair, reserved_state, mut csv) = setup_test(4);
         // Apply agenda commit with invalid agenda hash
         let agenda_transactions_hash = if let Commit::Transaction(transaction) =
-            generate_empty_transaction_commit()
+            generate_empty_transaction_commit(1)
         {
             Agenda::calculate_transactions_hash(&[transaction])
         } else {
@@ -1319,7 +1455,7 @@ mod test {
         };
         let agenda: Agenda = Agenda {
             author: reserved_state.query_name(&validator_keypair[0].0).unwrap(),
-            timestamp: 1,
+            timestamp: 2,
             transactions_hash: agenda_transactions_hash,
             height: csv.header.height + 1,
             previous_block_hash: csv.header.to_hash256(),
@@ -1333,7 +1469,7 @@ mod test {
     fn invalid_agenda_commit_with_invalid_agenda_hash2() {
         let (validator_keypair, reserved_state, mut csv) = setup_test(4);
         // Apply empty transaction commit
-        csv.apply_commit(&generate_empty_transaction_commit())
+        csv.apply_commit(&generate_empty_transaction_commit(1))
             .unwrap();
         // Apply agenda commit with invalid agenda hash
         let agenda_transactions_hash = Agenda::calculate_transactions_hash(&[]);
@@ -1353,7 +1489,7 @@ mod test {
     fn invalid_agenda_commit_with_invalid_timestamp() {
         let (validator_keypair, reserved_state, mut csv) = setup_test(4);
         // Apply empty transaction commit
-        csv.apply_commit(&generate_empty_transaction_commit())
+        csv.apply_commit(&generate_empty_transaction_commit(1))
             .unwrap();
         // Apply agenda commit with invalid timestamp
         let agenda: Agenda = Agenda {
@@ -1449,7 +1585,7 @@ mod test {
         };
         let proof =
             TypedSignature::sign(&delegation_transaction_data, &delegator_private_key).unwrap();
-        csv.apply_commit(&generate_extra_agenda_transaction(
+        csv.apply_commit(&generate_delegation_transaction_commit(
             &delegation_transaction_data,
             proof,
         ))
@@ -1584,7 +1720,7 @@ mod test {
     fn phase_mismatch_for_agenda_proof_commit2() {
         let (validator_keypair, reserved_state, mut csv) = setup_test(4);
         // Apply empty transaction commit
-        csv.apply_commit(&generate_empty_transaction_commit())
+        csv.apply_commit(&generate_empty_transaction_commit(1))
             .unwrap();
         // Apply agenda-proof commit at transaction phase
         let agenda_transactions_hash = calculate_agenda_transactions_hash(csv.phase.clone());
@@ -1601,6 +1737,180 @@ mod test {
             agenda.to_hash256(),
         ))
         .unwrap_err();
+    }
+
+    #[test]
+    /// Test the case where the member count of reserved state is less than 4.
+    fn invalid_reserved_state_with_too_few_members() {
+        // set validator_set_size to 3
+        let (_, reserved_state, mut csv) = setup_test(3);
+        // Apply reserved-diff commit to verify the reserved state
+        csv.apply_commit(&Commit::Transaction(Transaction {
+            author: "doesn't matter".to_owned(),
+            timestamp: 3,
+            head: "Test reserved-diff commit".to_string(),
+            body: String::new(),
+            diff: Diff::Reserved(Box::new(reserved_state)),
+        }))
+        .unwrap_err();
+    }
+
+    #[test]
+    /// Test the case where a consensus leader is not the one of members.
+    fn invalid_reserved_state_with_consensus_leader_not_in_members() {
+        let (_, mut reserved_state, mut csv) = setup_test(4);
+        // Add a member name that is not the one of members' names to consensus_leader_order
+        reserved_state
+            .consensus_leader_order
+            .push("stranger".to_string());
+        // Apply reserved-diff commit to verify the reserved state
+        csv.apply_commit(&Commit::Transaction(Transaction {
+            author: "doesn't matter".to_owned(),
+            timestamp: 3,
+            head: "Test reserved-diff commit".to_string(),
+            body: String::new(),
+            diff: Diff::Reserved(Box::new(reserved_state.clone())),
+        }))
+        .unwrap_err();
+    }
+
+    #[test]
+    /// Test the case where an expelled member is included in the consensus leader order.
+    fn invalid_reserved_state_with_expelled_member_in_consensus_leader_order() {
+        let (_, mut reserved_state, mut csv) = setup_test(4);
+        // Expel the first member
+        reserved_state.members[0].expelled = true;
+        // Apply reserved-diff commit to verify the reserved state
+        csv.apply_commit(&Commit::Transaction(Transaction {
+            author: "doesn't matter".to_owned(),
+            timestamp: 3,
+            head: "Test reserved-diff commit".to_string(),
+            body: String::new(),
+            diff: Diff::Reserved(Box::new(reserved_state)),
+        }))
+        .unwrap_err();
+    }
+
+    #[test]
+    /// Test the case where the genesis info is changed.
+    fn invalid_reserved_state_with_changed_genesis_info() {
+        let (validator_keypair, mut reserved_state, mut csv) = setup_test(4);
+        // Generate a new genesis header with different author_index
+        let author_index = 1;
+        let new_genesis_header: BlockHeader = BlockHeader {
+            author: validator_keypair[author_index].0.clone(),
+            prev_block_finalization_proof: FinalizationProof::genesis(),
+            previous_hash: Hash256::zero(),
+            height: 0,
+            timestamp: 0,
+            commit_merkle_root: OneshotMerkleTree::create(vec![]).root(),
+            repository_merkle_root: Hash256::zero(),
+            validator_set: validator_keypair
+                .iter()
+                .map(|(public_key, _)| (public_key.clone(), 1))
+                .collect(),
+            version: SIMPERBY_CORE_PROTOCOL_VERSION.to_string(),
+        };
+        // Change genesis info of the reserved state
+        reserved_state.genesis_info = GenesisInfo {
+            header: new_genesis_header.clone(),
+            genesis_proof: generate_unanimous_finalization_proof(
+                &validator_keypair,
+                &new_genesis_header,
+                0,
+            ),
+            chain_name: "PDAO Chain".to_string(),
+        };
+        // Apply reserved-diff commit to verify the reserved state
+        csv.apply_commit(&Commit::Transaction(Transaction {
+            author: "doesn't matter".to_owned(),
+            timestamp: 3,
+            head: "Test reserved-diff commit".to_string(),
+            body: String::new(),
+            diff: Diff::Reserved(Box::new(reserved_state)),
+        }))
+        .unwrap_err();
+    }
+
+    #[test]
+    /// Test the case where there is a duplicate member name.
+    fn invalid_reserved_state_with_duplicate_member_name() {
+        let (mut validator_keypair, mut reserved_state, mut csv) = setup_test(4);
+        // Generate a new member with duplicate name
+        validator_keypair.push(generate_keypair([4]));
+        reserved_state.members.push(Member {
+            public_key: validator_keypair.last().unwrap().0.clone(),
+            name: "member0".to_string(), // duplicate name
+            governance_voting_power: 1,
+            consensus_voting_power: 1,
+            governance_delegatee: None,
+            consensus_delegatee: None,
+            expelled: false,
+        });
+        // Apply reserved-diff commit to verify the reserved state
+        csv.apply_commit(&Commit::Transaction(Transaction {
+            author: "doesn't matter".to_owned(),
+            timestamp: 3,
+            head: "Test reserved-diff commit".to_string(),
+            body: String::new(),
+            diff: Diff::Reserved(Box::new(reserved_state.clone())),
+        }))
+        .unwrap_err();
+    }
+
+    #[test]
+    /// Test the case where there is a duplicate public key.
+    fn invalid_reserved_state_with_duplicate_public_key() {
+        let (validator_keypair, mut reserved_state, mut csv) = setup_test(4);
+        // Generate a new member with duplicate public key
+        reserved_state.members.push(Member {
+            public_key: validator_keypair[0].0.clone(), // duplicate public key
+            name: format!("member{}", validator_keypair.len() - 1),
+            governance_voting_power: 1,
+            consensus_voting_power: 1,
+            governance_delegatee: None,
+            consensus_delegatee: None,
+            expelled: false,
+        });
+        // Apply reserved-diff commit to verify the reserved state
+        csv.apply_commit(&Commit::Transaction(Transaction {
+            author: "doesn't matter".to_owned(),
+            timestamp: 3,
+            head: "Test reserved-diff commit".to_string(),
+            body: String::new(),
+            diff: Diff::Reserved(Box::new(reserved_state.clone())),
+        }))
+        .unwrap_err();
+    }
+
+    #[test]
+    /// Test the case where the member names don't monotonically increase.
+    fn invalid_reserved_state_with_non_monotonic_increased_member_names() {
+        let (_, mut reserved_state, mut csv) = setup_test(5);
+        // Remove one from members instead of setting Member::expelled to true
+        reserved_state.members.pop();
+        reserved_state.consensus_leader_order.pop();
+        // Apply reserved-diff commit to verify the reserved state
+        csv.apply_commit(&Commit::Transaction(Transaction {
+            author: "doesn't matter".to_owned(),
+            timestamp: 3,
+            head: "Test reserved-diff commit".to_string(),
+            body: String::new(),
+            diff: Diff::Reserved(Box::new(reserved_state.clone())),
+        }))
+        .unwrap_err();
+    }
+
+    #[test]
+    fn test_verify_reserved_state_version_advance() {
+        // configuring the test
+        let (mut _validator_keypair, reserved_state, csv) = setup_test(4);
+
+        // rendering the reserved state that is expected to be valid
+        let mut valid_rs = reserved_state;
+        valid_rs.version = "1.1.0".to_string(); // set a version that is greater than the previous version
+
+        assert!(csv.verify_reserved_state(&valid_rs).is_ok());
     }
 
     #[ignore]
@@ -1640,7 +1950,7 @@ mod test {
         };
         let proof =
             TypedSignature::sign(&delegation_transaction_data, &delegator_private_key).unwrap();
-        csv.apply_commit(&generate_extra_agenda_transaction(
+        csv.apply_commit(&generate_delegation_transaction_commit(
             &delegation_transaction_data,
             proof,
         ))
@@ -1715,6 +2025,7 @@ mod test {
             consensus_voting_power: 100,
             governance_delegatee: None,
             consensus_delegatee: None,
+            expelled: false,
         };
         let delegatee = reserved_state.members[0].clone();
         let delegation_transaction_data: DelegationTransactionData = DelegationTransactionData {
@@ -1727,7 +2038,7 @@ mod test {
         };
         let proof: TypedSignature<DelegationTransactionData> =
             TypedSignature::sign(&delegation_transaction_data, &delegator_private_key).unwrap();
-        csv.apply_commit(&generate_extra_agenda_transaction(
+        csv.apply_commit(&generate_delegation_transaction_commit(
             &delegation_transaction_data,
             proof,
         ))
@@ -1737,28 +2048,151 @@ mod test {
     #[ignore]
     #[test]
     // Test the case where the `Delegate` extra-agenda transaction is invalid because the delegator has already delegated.
-    /// This test case is ignored because the extra-agenda transaction is not implemented yet.
-    // TODO: enable this test case when the extra-agenda transaction is implemented.
     fn invalid_delegate_transaction_with_invalid_delegator2() {
-        todo!("Implement this test")
+        let (validator_keypair, reserved_state, mut csv) = setup_test(4);
+        // Apply agenda commit
+        let agenda_transactions_hash = calculate_agenda_transactions_hash(csv.phase.clone());
+        let agenda: Agenda = Agenda {
+            author: reserved_state.query_name(&validator_keypair[0].0).unwrap(),
+            timestamp: 1,
+            transactions_hash: agenda_transactions_hash,
+            height: csv.header.height + 1,
+            previous_block_hash: csv.header.to_hash256(),
+        };
+        csv.apply_commit(&generate_agenda_commit(&agenda)).unwrap();
+        // Apply agenda-proof commit
+        csv.apply_commit(&generate_agenda_proof_commit(
+            &validator_keypair,
+            &agenda,
+            agenda.to_hash256(),
+        ))
+        .unwrap();
+        // Apply extra-agenda transaction commit
+        // delegator: member-1, delegatee: member-2
+        let delegator = reserved_state.members[1].clone();
+        let delegator_private_key = validator_keypair[1].1.clone();
+        let delegatee = reserved_state.members[2].clone();
+        let delegation_transaction_data: DelegationTransactionData = DelegationTransactionData {
+            delegator: delegator.name.clone(),
+            delegatee: delegatee.name,
+            governance: true,
+            block_height: csv.header.height + 1,
+            timestamp: 2,
+            chain_name: reserved_state.genesis_info.chain_name.clone(),
+        };
+        let proof: TypedSignature<DelegationTransactionData> =
+            TypedSignature::sign(&delegation_transaction_data, &delegator_private_key).unwrap();
+        csv.apply_commit(&generate_delegation_transaction_commit(
+            &delegation_transaction_data,
+            proof,
+        ))
+        .unwrap();
+        // Apply extra-agenda transaction commit
+        // delegator: member-1, delegatee: member-3
+        let delegatee = reserved_state.members[3].clone();
+        let delegation_transaction_data: DelegationTransactionData = DelegationTransactionData {
+            delegator: delegator.name,
+            delegatee: delegatee.name,
+            governance: true,
+            block_height: csv.header.height + 1,
+            timestamp: 3,
+            chain_name: reserved_state.genesis_info.chain_name,
+        };
+        let proof: TypedSignature<DelegationTransactionData> =
+            TypedSignature::sign(&delegation_transaction_data, &delegator_private_key).unwrap();
+        csv.apply_commit(&generate_delegation_transaction_commit(
+            &delegation_transaction_data,
+            proof,
+        ))
+        .unwrap_err();
     }
 
     #[ignore]
     #[test]
     // Test the case where the `Delegate` extra-agenda transaction is invalid because the delegatee is not a member.
-    /// This test case is ignored because the extra-agenda transaction is not implemented yet.
-    // TODO: enable this test case when the extra-agenda transaction is implemented.
     fn invalid_delegate_transaction_with_invalid_delegatee() {
-        todo!("Implement this test")
+        let (validator_keypair, reserved_state, mut csv) = setup_test(4);
+        // Apply agenda commit
+        let agenda_transactions_hash = calculate_agenda_transactions_hash(csv.phase.clone());
+        let agenda: Agenda = Agenda {
+            author: reserved_state.query_name(&validator_keypair[0].0).unwrap(),
+            timestamp: 1,
+            transactions_hash: agenda_transactions_hash,
+            height: csv.header.height + 1,
+            previous_block_hash: csv.header.to_hash256(),
+        };
+        csv.apply_commit(&generate_agenda_commit(&agenda)).unwrap();
+        // Apply agenda-proof commit
+        csv.apply_commit(&generate_agenda_proof_commit(
+            &validator_keypair,
+            &agenda,
+            agenda.to_hash256(),
+        ))
+        .unwrap();
+        // Apply extra-agenda transaction commit
+        // delegator: member-1, delegatee: not-a-member
+        let delegator = reserved_state.members[1].clone();
+        let delegator_private_key = validator_keypair[1].1.clone();
+        let delegation_transaction_data: DelegationTransactionData = DelegationTransactionData {
+            delegator: delegator.name,
+            delegatee: "not-a-member".to_string(),
+            governance: true,
+            block_height: csv.header.height + 1,
+            timestamp: 2,
+            chain_name: reserved_state.genesis_info.chain_name,
+        };
+        let proof =
+            TypedSignature::sign(&delegation_transaction_data, &delegator_private_key).unwrap();
+        csv.apply_commit(&generate_delegation_transaction_commit(
+            &delegation_transaction_data,
+            proof,
+        ))
+        .unwrap_err();
     }
 
     #[ignore]
     #[test]
     // Test the case where the `Delegate` extra-agenda transaction is invalid because the signature is invalid.
-    /// This test case is ignored because the extra-agenda transaction is not implemented yet.
-    // TODO: enable this test case when the extra-agenda transaction is implemented.
     fn invalid_delegate_transaction_with_invalid_signature() {
-        todo!("Implement this test")
+        let (validator_keypair, reserved_state, mut csv) = setup_test(4);
+        // Apply agenda commit
+        let agenda_transactions_hash = calculate_agenda_transactions_hash(csv.phase.clone());
+        let agenda: Agenda = Agenda {
+            author: reserved_state.query_name(&validator_keypair[0].0).unwrap(),
+            timestamp: 1,
+            transactions_hash: agenda_transactions_hash,
+            height: csv.header.height + 1,
+            previous_block_hash: csv.header.to_hash256(),
+        };
+        csv.apply_commit(&generate_agenda_commit(&agenda)).unwrap();
+        // Apply agenda-proof commit
+        csv.apply_commit(&generate_agenda_proof_commit(
+            &validator_keypair,
+            &agenda,
+            agenda.to_hash256(),
+        ))
+        .unwrap();
+        // Apply extra-agenda transaction commit
+        // delegator: member-1, delegatee: member-2
+        // The signature is signed by member-3's private key
+        let delegator = reserved_state.members[1].clone();
+        let non_delegator_private_key = validator_keypair[3].1.clone();
+        let delegatee = reserved_state.members[2].clone();
+        let delegation_transaction_data: DelegationTransactionData = DelegationTransactionData {
+            delegator: delegator.name,
+            delegatee: delegatee.name,
+            governance: true,
+            block_height: csv.header.height + 1,
+            timestamp: 2,
+            chain_name: reserved_state.genesis_info.chain_name,
+        };
+        let proof =
+            TypedSignature::sign(&delegation_transaction_data, &non_delegator_private_key).unwrap();
+        csv.apply_commit(&generate_delegation_transaction_commit(
+            &delegation_transaction_data,
+            proof,
+        ))
+        .unwrap_err();
     }
 
     #[ignore]
@@ -1773,10 +2207,71 @@ mod test {
     #[ignore]
     #[test]
     // Test the case where the `Undelegate` extra-agenda transaction is invalid because the delegator is not a member.
-    /// This test case is ignored because the extra-agenda transaction is not implemented yet.
-    /// TODO: enable this test case when the extra-agenda transaction is implemented.
     fn invalid_undelegate_transaction_with_invalid_delegator1() {
-        todo!("Implement this test")
+        let (validator_keypair, reserved_state, mut csv) = setup_test(4);
+        // Apply agenda commit
+        let agenda_transactions_hash = calculate_agenda_transactions_hash(csv.phase.clone());
+        let agenda: Agenda = Agenda {
+            author: reserved_state.query_name(&validator_keypair[0].0).unwrap(),
+            timestamp: 1,
+            transactions_hash: agenda_transactions_hash,
+            height: csv.header.height + 1,
+            previous_block_hash: csv.header.to_hash256(),
+        };
+        csv.apply_commit(&generate_agenda_commit(&agenda)).unwrap();
+        // Apply agenda-proof commit
+        csv.apply_commit(&generate_agenda_proof_commit(
+            &validator_keypair,
+            &agenda,
+            agenda.to_hash256(),
+        ))
+        .unwrap();
+        // Apply extra-agenda transaction commit
+        // delegator: member-1, delegatee: member-2
+        let delegator = reserved_state.members[1].clone();
+        let delegator_private_key = validator_keypair[1].1.clone();
+        let delegatee = reserved_state.members[2].clone();
+        let delegation_transaction_data: DelegationTransactionData = DelegationTransactionData {
+            delegator: delegator.name,
+            delegatee: delegatee.name,
+            governance: true,
+            block_height: csv.header.height + 1,
+            timestamp: 2,
+            chain_name: reserved_state.genesis_info.chain_name.clone(),
+        };
+        let proof =
+            TypedSignature::sign(&delegation_transaction_data, &delegator_private_key).unwrap();
+        csv.apply_commit(&generate_delegation_transaction_commit(
+            &delegation_transaction_data,
+            proof,
+        ))
+        .unwrap();
+        // Apply `Undelegate` extra-agenda transaction commit with the delegator is not a member.
+        // delegator: not-a-member
+        let (delegator_public_key, delegator_private_key) = generate_keypair_random();
+        let delegator = Member {
+            public_key: delegator_public_key,
+            name: "not-a-member".to_string(),
+            governance_voting_power: 100,
+            consensus_voting_power: 100,
+            governance_delegatee: None,
+            consensus_delegatee: None,
+            expelled: false,
+        };
+        let undelegation_transaction_data: UndelegationTransactionData =
+            UndelegationTransactionData {
+                delegator: delegator.name,
+                block_height: csv.header.height + 1,
+                timestamp: 2,
+                chain_name: reserved_state.genesis_info.chain_name,
+            };
+        let proof: TypedSignature<UndelegationTransactionData> =
+            TypedSignature::sign(&undelegation_transaction_data, &delegator_private_key).unwrap();
+        csv.apply_commit(&generate_undelegation_transaction_commit(
+            &undelegation_transaction_data,
+            proof,
+        ))
+        .unwrap_err();
     }
 
     #[ignore]
@@ -1791,10 +2286,62 @@ mod test {
     #[ignore]
     #[test]
     // Test the case where the `Undelegate` extra-agenda transaction is invalid because the signature is invalid.
-    /// This test case is ignored because the extra-agenda transaction is not implemented yet.
-    // TODO: enable this test case when the extra-agenda transaction is implemented.
     fn invalid_undelegate_transaction_with_invalid_signature() {
-        todo!("Implement this test")
+        let (validator_keypair, reserved_state, mut csv) = setup_test(4);
+        // Apply agenda commit
+        let agenda_transactions_hash = calculate_agenda_transactions_hash(csv.phase.clone());
+        let agenda: Agenda = Agenda {
+            author: reserved_state.query_name(&validator_keypair[0].0).unwrap(),
+            timestamp: 1,
+            transactions_hash: agenda_transactions_hash,
+            height: csv.header.height + 1,
+            previous_block_hash: csv.header.to_hash256(),
+        };
+        csv.apply_commit(&generate_agenda_commit(&agenda)).unwrap();
+        // Apply agenda-proof commit
+        csv.apply_commit(&generate_agenda_proof_commit(
+            &validator_keypair,
+            &agenda,
+            agenda.to_hash256(),
+        ))
+        .unwrap();
+        // Apply extra-agenda transaction commit
+        // delegator: member-1, delegatee: member-2
+        let delegator = reserved_state.members[1].clone();
+        let delegator_private_key = validator_keypair[1].1.clone();
+        let delegatee = reserved_state.members[2].clone();
+        let delegation_transaction_data: DelegationTransactionData = DelegationTransactionData {
+            delegator: delegator.name.clone(),
+            delegatee: delegatee.name,
+            governance: true,
+            block_height: csv.header.height + 1,
+            timestamp: 2,
+            chain_name: reserved_state.genesis_info.chain_name.clone(),
+        };
+        let proof =
+            TypedSignature::sign(&delegation_transaction_data, &delegator_private_key).unwrap();
+        csv.apply_commit(&generate_delegation_transaction_commit(
+            &delegation_transaction_data,
+            proof,
+        ))
+        .unwrap();
+        // Apply `Undelegate` extra-agenda transaction commit with invalid signature
+        let non_delegator_private_key = validator_keypair[3].1.clone();
+        let undelegation_transaction_data: UndelegationTransactionData =
+            UndelegationTransactionData {
+                delegator: delegator.name,
+                block_height: csv.header.height + 1,
+                timestamp: 2,
+                chain_name: reserved_state.genesis_info.chain_name,
+            };
+        let invalid_proof =
+            TypedSignature::sign(&undelegation_transaction_data, &non_delegator_private_key)
+                .unwrap();
+        csv.apply_commit(&generate_undelegation_transaction_commit(
+            &undelegation_transaction_data,
+            invalid_proof,
+        ))
+        .unwrap_err();
     }
 
     #[ignore]

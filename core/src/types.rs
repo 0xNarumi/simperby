@@ -24,6 +24,10 @@ pub struct Member {
     /// If this member delegated its governance consensus power to another member,
     /// the delegatee.
     pub consensus_delegatee: Option<MemberName>,
+    /// If true, all voting powers are ignored.
+    /// Note that once granted, Simperby keeps all members forever in the reserved state.
+    /// If you want to remove a member, you must set this to true instead of removing the member.
+    pub expelled: bool,
     // TODO: add various conditions for each delegation.
     // - Unlock-Automatically-After-N-Blocks
     // - Unlock-Automatically-After-T-Seconds
@@ -260,4 +264,19 @@ pub struct FinalizationInfo {
     pub commit_hash: CommitHash,
     pub reserved_state: ReservedState,
     pub proof: FinalizationProof,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CommitHash;
+    use serde_json::{from_str, to_string};
+
+    #[test]
+    fn en_decode_commit_hash() {
+        let commit_hash = CommitHash { hash: [1; 20] };
+        let serialized = to_string(&commit_hash).unwrap();
+        assert_eq!(serialized, "\"0101010101010101010101010101010101010101\"");
+        let deserialized: CommitHash = from_str(&serialized).unwrap();
+        assert_eq!(deserialized, commit_hash);
+    }
 }

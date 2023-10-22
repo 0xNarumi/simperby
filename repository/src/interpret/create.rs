@@ -95,10 +95,23 @@ pub async fn approve(
         .await?;
     raw.checkout(agenda_proof_branch_name).await?;
     let agenda_proof_commit_hash = raw
-        .create_semantic_commit(agenda_proof_semantic_commit)
+        .create_semantic_commit(agenda_proof_semantic_commit, true)
         .await?;
 
     Ok(agenda_proof_commit_hash)
+}
+
+pub async fn create_transaction(
+    raw: &mut RawRepository,
+    transaction: Transaction,
+) -> Result<CommitHash, Error> {
+    let reserved_state = read_last_finalized_reserved_state(raw).await?;
+    Ok(raw
+        .create_semantic_commit(
+            format::to_semantic_commit(&Commit::Transaction(transaction), reserved_state)?,
+            true,
+        )
+        .await?)
 }
 
 pub async fn create_agenda(
@@ -149,7 +162,7 @@ pub async fn create_agenda(
     let semantic_commit = to_semantic_commit(&agenda_commit, reserved_state)?;
 
     raw.checkout_clean().await?;
-    let result = raw.create_semantic_commit(semantic_commit).await?;
+    let result = raw.create_semantic_commit(semantic_commit, true).await?;
     let mut agenda_branch_name = agenda_commit.to_hash256().to_string();
     agenda_branch_name.truncate(BRANCH_NAME_HASH_DIGITS);
     let agenda_branch_name = format!("a-{agenda_branch_name}");
@@ -215,7 +228,7 @@ pub async fn create_block(
 
     raw.checkout_clean().await?;
     raw.checkout_detach(head).await?;
-    let result = raw.create_semantic_commit(semantic_commit).await?;
+    let result = raw.create_semantic_commit(semantic_commit, true).await?;
     let mut block_branch_name = block_commit.to_hash256().to_string();
     block_branch_name.truncate(BRANCH_NAME_HASH_DIGITS);
     let block_branch_name = format!("b-{block_branch_name}");
@@ -261,7 +274,7 @@ pub async fn create_extra_agenda_transaction(
     let semantic_commit = to_semantic_commit(&extra_agenda_tx_commit, reserved_state)?;
 
     raw.checkout_clean().await?;
-    let result = raw.create_semantic_commit(semantic_commit).await?;
+    let result = raw.create_semantic_commit(semantic_commit, false).await?;
     Ok(result)
 }
 
@@ -299,10 +312,13 @@ pub async fn finalize(
                 _ => eyre!(e),
             })?;
         let commit_hash = raw
-            .create_semantic_commit(format::fp_to_semantic_commit(&LastFinalizationProof {
-                height: block.height,
-                proof,
-            }))
+            .create_semantic_commit(
+                format::fp_to_semantic_commit(&LastFinalizationProof {
+                    height: block.height,
+                    proof,
+                }),
+                true,
+            )
             .await?;
         sync(raw, commit_hash)
             .await?

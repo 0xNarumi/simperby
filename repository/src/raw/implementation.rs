@@ -116,7 +116,16 @@ impl RawRepositoryInner {
     }
 
     pub(crate) fn locate_branch(&self, branch: Branch) -> Result<CommitHash, Error> {
-        let branch = self.repo.find_branch(&branch, BranchType::Local)?;
+        let branch = self
+            .repo
+            .find_branch(&branch, BranchType::Local)
+            .map_err(|err| {
+                if err.code() == git2::ErrorCode::NotFound {
+                    Error::NotFound("branch not found".to_string())
+                } else {
+                    Error::Unknown("err".to_string())
+                }
+            })?;
         let oid = branch
             .get()
             .target()
@@ -269,7 +278,7 @@ impl RawRepositoryInner {
 
         let result = {
             // The `time` specified is in seconds since the epoch, and the `offset` is the time zone offset in minutes.
-            let time = git2::Time::new(commit.timestamp, -540);
+            let time = git2::Time::new(commit.timestamp, 540);
             let signature = git2::Signature::new(&commit.author, &commit.email, &time)?;
             let mut index = self.repo.index()?;
             let head = self.get_head()?;
@@ -329,7 +338,7 @@ impl RawRepositoryInner {
 
     pub(crate) fn create_commit_all(&mut self, commit: RawCommit) -> Result<CommitHash, Error> {
         // The `time` specified is in seconds since the epoch, and the `offset` is the time zone offset in minutes.
-        let time = git2::Time::new(commit.timestamp, -540);
+        let time = git2::Time::new(commit.timestamp, 540);
         let signature = git2::Signature::new(&commit.author, &commit.email, &time)?;
 
         // Add all files to the index.
@@ -396,14 +405,23 @@ impl RawRepositoryInner {
     pub(crate) fn create_semantic_commit(
         &mut self,
         commit: SemanticCommit,
+        authored_by_simperby: bool,
     ) -> Result<CommitHash, Error> {
+        let time = git2::Time::new(commit.timestamp / 1000, 540);
+        let sig = if authored_by_simperby {
+            git2::Signature::new("Simperby", "hi@simperby.net", &time)?
+        } else {
+            let config = self.repo.config()?;
+            let name = config.get_string("user.name")?;
+            let email = config.get_string("user.email")?;
+            git2::Signature::new(name.as_str(), email.as_str(), &time)?
+        };
         match commit.diff {
             Diff::None => {
-                let sig = self.repo.signature()?;
                 let mut index = self.repo.index()?;
                 let id = index.write_tree()?;
                 let tree = self.repo.find_tree(id)?;
-                let commit_message = format!("{}{}{}", commit.title, "\n\n", commit.body); // TODO: Check "\n" divides commit message's head and body.
+                let commit_message = format!("{}{}{}", commit.title, "\n\n", commit.body);
                 let head = self.get_head()?;
                 let parent_oid = Oid::from_bytes(&head.hash)?;
                 let parent_commit = self.repo.find_commit(parent_oid)?;
@@ -432,7 +450,6 @@ impl RawRepositoryInner {
                 let mut index = self.repo.index()?;
                 index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
 
-                let sig = self.repo.signature()?;
                 let id = index.write_tree()?;
                 let tree = self.repo.find_tree(id)?;
                 let commit_message = format!("{}{}{}", commit.title, "\n\n", commit.body); // TODO: Check "\n" divides commit message's head and body.

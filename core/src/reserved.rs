@@ -25,6 +25,7 @@ impl ReservedState {
         let validator_set = self
             .members
             .iter()
+            .filter(|member| !member.expelled)
             .map(|member| {
                 let name = member
                     .consensus_delegatee
@@ -55,6 +56,7 @@ impl ReservedState {
         let governance_set = self
             .members
             .iter()
+            .filter(|member| !member.expelled)
             .map(|member| {
                 let name = member
                     .governance_delegatee
@@ -82,28 +84,39 @@ impl ReservedState {
     }
 
     pub fn apply_delegate(&mut self, tx: &TxDelegate) -> Result<Self, String> {
+        match self.is_expelled(&tx.data.delegator) {
+            Some(false) => {}
+            Some(true) => return Err("delegator is expelled".to_string()),
+            None => return Err("delegator not found by name".to_string()),
+        }
         if tx.data.delegator == tx.data.delegatee {
             return Err(format!(
                 "delegator and delegatee are the same: {}",
                 tx.data.delegator
             ));
         }
-        if let Some(key) = self.query_public_key(&tx.data.delegator) {
-            if &key != tx.proof.signer() {
-                return Err(
-                    "the key used for the proof does not match the key in the reserved state"
-                        .to_string(),
-                );
-            }
+        let key = self
+            .query_public_key(&tx.data.delegator)
+            .expect("delegator exists");
+        if &key != tx.proof.signer() {
+            return Err(
+                "the key used for the proof does not match the key in the reserved state"
+                    .to_string(),
+            );
         }
-        if !self.is_member(&tx.data.delegatee) {
-            return Err("delegatee not found by name".to_string());
+        match self.is_expelled(&tx.data.delegatee) {
+            Some(false) => {}
+            Some(true) => return Err("delegatee is expelled".to_string()),
+            None => return Err("delegatee not found by name".to_string()),
         }
         if tx.proof.verify(&tx.data).is_err() {
             return Err("delegation proof verification failed".to_string());
         }
         for delegator in &mut self.members {
             if delegator.name == tx.data.delegator {
+                if delegator.consensus_delegatee.is_some() {
+                    return Err("consensus_delegatee is already set".to_string());
+                }
                 if tx.data.governance {
                     delegator.governance_delegatee = Some(tx.data.delegatee.clone());
                     delegator.consensus_delegatee = Some(tx.data.delegatee.clone());
@@ -117,13 +130,19 @@ impl ReservedState {
     }
 
     pub fn apply_undelegate(&mut self, tx: &TxUndelegate) -> Result<Self, String> {
-        if let Some(key) = self.query_public_key(&tx.data.delegator) {
-            if &key != tx.proof.signer() {
-                return Err(
-                    "the key used for the proof does not match the key in the reserved state"
-                        .to_string(),
-                );
-            }
+        match self.is_expelled(&tx.data.delegator) {
+            Some(false) => {}
+            Some(true) => return Err("delegator is expelled".to_string()),
+            None => return Err("delegator not found by name".to_string()),
+        }
+        let key = self
+            .query_public_key(&tx.data.delegator)
+            .expect("delegator exists");
+        if &key != tx.proof.signer() {
+            return Err(
+                "the key used for the proof does not match the key in the reserved state"
+                    .to_string(),
+            );
         }
         if tx.proof.verify(&tx.data).is_err() {
             return Err("delegation proof verification failed".to_string());
@@ -160,13 +179,13 @@ impl ReservedState {
         None
     }
 
-    pub fn is_member(&self, name: &MemberName) -> bool {
+    pub fn is_expelled(&self, name: &MemberName) -> Option<bool> {
         for member in &self.members {
             if &member.name == name {
-                return true;
+                return Some(member.expelled);
             }
         }
-        false
+        None
     }
 }
 
@@ -185,6 +204,19 @@ mod tests {
             consensus_voting_power: 1,
             governance_delegatee: None,
             consensus_delegatee: None,
+            expelled: false,
+        }
+    }
+
+    fn create_expelled_member(keys: Vec<(PublicKey, PrivateKey)>, member_num: u8) -> Member {
+        Member {
+            public_key: keys[member_num as usize].0.clone(),
+            name: format!("member-{member_num:04}"),
+            governance_voting_power: 1,
+            consensus_voting_power: 1,
+            governance_delegatee: None,
+            consensus_delegatee: None,
+            expelled: true,
         }
     }
 
@@ -200,6 +232,7 @@ mod tests {
             consensus_voting_power: 1,
             governance_delegatee: None,
             consensus_delegatee: Some(format!("member-{delegatee_member_num:04}")),
+            expelled: false,
         }
     }
 
@@ -215,6 +248,39 @@ mod tests {
             consensus_voting_power: 1,
             governance_delegatee: Some(format!("member-{delegatee_member_num:04}")),
             consensus_delegatee: None,
+            expelled: false,
+        }
+    }
+
+    fn create_expelled_member_with_consensus_delegation(
+        keys: Vec<(PublicKey, PrivateKey)>,
+        member_num: u8,
+        delegatee_member_num: u8,
+    ) -> Member {
+        Member {
+            public_key: keys[member_num as usize].0.clone(),
+            name: format!("member-{member_num:04}"),
+            governance_voting_power: 1,
+            consensus_voting_power: 1,
+            governance_delegatee: None,
+            consensus_delegatee: Some(format!("member-{delegatee_member_num:04}")),
+            expelled: true,
+        }
+    }
+
+    fn create_expelled_member_with_governance_delegation(
+        keys: Vec<(PublicKey, PrivateKey)>,
+        member_num: u8,
+        delegatee_member_num: u8,
+    ) -> Member {
+        Member {
+            public_key: keys[member_num as usize].0.clone(),
+            name: format!("member-{member_num:04}"),
+            governance_voting_power: 1,
+            consensus_voting_power: 1,
+            governance_delegatee: Some(format!("member-{delegatee_member_num:04}")),
+            consensus_delegatee: None,
+            expelled: true,
         }
     }
 
@@ -458,6 +524,136 @@ mod tests {
     }
 
     #[test]
+    fn validator_set_with_expelled_members() {
+        setup_test();
+        let keys = (0..5)
+            .map(|i| generate_keypair(format!("{i}")))
+            .collect::<Vec<_>>();
+        let members = vec![
+            create_expelled_member_with_consensus_delegation(keys.clone(), 0, 1),
+            create_member(keys.clone(), 1),
+            create_expelled_member_with_consensus_delegation(keys.clone(), 2, 3),
+            create_member(keys.clone(), 3),
+            create_member_with_consensus_delegation(keys.clone(), 4, 1),
+        ];
+        let genesis_header = BlockHeader {
+            author: PublicKey::zero(),
+            prev_block_finalization_proof: FinalizationProof::genesis(),
+            previous_hash: Hash256::zero(),
+            height: 0,
+            timestamp: 0,
+            commit_merkle_root: Hash256::zero(),
+            repository_merkle_root: Hash256::zero(),
+            validator_set: members
+                .iter()
+                .map(|member| (member.public_key.clone(), member.consensus_voting_power))
+                .collect::<Vec<_>>(),
+            version: "0.1.0".to_string(),
+        };
+        let genesis_info = GenesisInfo {
+            header: genesis_header.clone(),
+            genesis_proof: FinalizationProof {
+                round: 0,
+                signatures: keys
+                    .iter()
+                    .map(|(_, private_key)| {
+                        TypedSignature::sign(
+                            &FinalizationSignTarget {
+                                block_hash: genesis_header.to_hash256(),
+                                round: 0,
+                            },
+                            private_key,
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+            },
+            chain_name: "test-chain".to_string(),
+        };
+        let reserved_state = ReservedState {
+            genesis_info,
+            members,
+            consensus_leader_order: vec!["member-0001".to_string(), "member-0003".to_string()],
+            version: "0.1.0".to_string(),
+        };
+        assert_eq!(
+            reserved_state
+                .get_validator_set()
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            vec![(keys[1].0.clone(), 2), (keys[3].0.clone(), 1),]
+                .into_iter()
+                .collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn governance_set_with_expelled_members() {
+        setup_test();
+        let keys = (0..5)
+            .map(|i| generate_keypair(format!("{i}")))
+            .collect::<Vec<_>>();
+        let members = vec![
+            create_expelled_member_with_governance_delegation(keys.clone(), 0, 1),
+            create_member(keys.clone(), 1),
+            create_expelled_member_with_governance_delegation(keys.clone(), 2, 3),
+            create_member(keys.clone(), 3),
+            create_member_with_governance_delegation(keys.clone(), 4, 1),
+        ];
+        let genesis_header = BlockHeader {
+            author: PublicKey::zero(),
+            prev_block_finalization_proof: FinalizationProof::genesis(),
+            previous_hash: Hash256::zero(),
+            height: 0,
+            timestamp: 0,
+            commit_merkle_root: Hash256::zero(),
+            repository_merkle_root: Hash256::zero(),
+            validator_set: members
+                .iter()
+                .map(|member| (member.public_key.clone(), member.consensus_voting_power))
+                .collect::<Vec<_>>(),
+            version: "0.1.0".to_string(),
+        };
+        let genesis_info = GenesisInfo {
+            header: genesis_header.clone(),
+            genesis_proof: FinalizationProof {
+                round: 0,
+                signatures: keys
+                    .iter()
+                    .map(|(_, private_key)| {
+                        TypedSignature::sign(
+                            &FinalizationSignTarget {
+                                block_hash: genesis_header.to_hash256(),
+                                round: 0,
+                            },
+                            private_key,
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+            },
+            chain_name: "test-chain".to_string(),
+        };
+        let reserved_state = ReservedState {
+            genesis_info,
+            members,
+            consensus_leader_order: (0..5).map(|i| format!("member-{i:04}")).collect::<Vec<_>>(),
+            version: "0.1.0".to_string(),
+        };
+        assert_eq!(
+            reserved_state
+                .get_governance_set()
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            vec![(keys[1].0.clone(), 2), (keys[3].0.clone(), 1),]
+                .into_iter()
+                .collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
     fn test_apply_delegate_on_governance_and_consensus_success() {
         // given
         setup_test();
@@ -517,6 +713,120 @@ mod tests {
                 .1,
             2
         );
+    }
+
+    #[test]
+    fn test_apply_delegate_on_consensus_success_with_expelled_members() {
+        // given
+        setup_test();
+        let (mut reserved_state, keys) = generate_standard_genesis(5); // Increased to 5 members
+
+        // Create expelled members
+        reserved_state.members[1] =
+            create_expelled_member_with_consensus_delegation(keys.clone(), 1, 2);
+        reserved_state.members[3] = create_expelled_member(keys.clone(), 3);
+        reserved_state.members[4] =
+            create_expelled_member_with_consensus_delegation(keys.clone(), 4, 2);
+
+        let delegator = reserved_state.members[0].clone();
+        let delegator_private_key = keys[0].1.clone();
+        let existing_delegatee = reserved_state.members[2].clone();
+        let non_existing_delegatee = reserved_state.members[3].clone();
+
+        // when
+        let data: DelegationTransactionData = DelegationTransactionData {
+            delegator: delegator.name,
+            delegatee: existing_delegatee.name.clone(),
+            governance: false,
+            block_height: 0,
+            timestamp: 0,
+            chain_name: reserved_state.genesis_info.chain_name.clone(),
+        };
+        let proof = TypedSignature::sign(&data, &delegator_private_key).unwrap();
+
+        let tx = TxDelegate { data, proof };
+        let new_state = reserved_state.apply_delegate(&tx);
+
+        // then
+        assert!(new_state.is_ok());
+        let new_state = new_state.unwrap();
+        let new_state_validator_set = new_state.get_validator_set().unwrap();
+
+        assert_eq!(
+            new_state_validator_set
+                .iter()
+                .find(|v| v.0 == existing_delegatee.public_key)
+                .unwrap()
+                .1,
+            2
+        );
+
+        // assert that non_existing_delegatee should not exists on the validator_set
+        assert!(!new_state_validator_set
+            .iter()
+            .any(|v| v.0 == non_existing_delegatee.public_key));
+
+        // make sure expelled members are not part of the validator sets
+        assert!(!new_state_validator_set
+            .iter()
+            .any(|v| v.0 == keys[1].0 || v.0 == keys[4].0));
+    }
+
+    #[test]
+    fn test_apply_delegate_on_governance_success_with_expelled_members() {
+        // given
+        setup_test();
+        let (mut reserved_state, keys) = generate_standard_genesis(5); // Increased to 5 members
+
+        // Create expelled members
+        reserved_state.members[1] =
+            create_expelled_member_with_governance_delegation(keys.clone(), 1, 2);
+        reserved_state.members[3] = create_expelled_member(keys.clone(), 3);
+        reserved_state.members[4] =
+            create_expelled_member_with_governance_delegation(keys.clone(), 4, 2);
+
+        let delegator = reserved_state.members[0].clone();
+        let delegator_private_key = keys[0].1.clone();
+        let existing_delegatee = reserved_state.members[2].clone();
+        let non_existing_delegatee = reserved_state.members[3].clone();
+
+        // when
+        let data: DelegationTransactionData = DelegationTransactionData {
+            delegator: delegator.name,
+            delegatee: existing_delegatee.name.clone(),
+            governance: true,
+            block_height: 0,
+            timestamp: 0,
+            chain_name: reserved_state.genesis_info.chain_name.clone(),
+        };
+        let proof = TypedSignature::sign(&data, &delegator_private_key).unwrap();
+
+        let tx = TxDelegate { data, proof };
+        let new_state = reserved_state.apply_delegate(&tx);
+
+        // then
+        assert!(new_state.is_ok());
+        let new_state = new_state.unwrap();
+        let new_state_governance_set = new_state.get_governance_set().unwrap();
+
+        assert_eq!(
+            new_state_governance_set
+                .iter()
+                .find(|v| v.0 == existing_delegatee.public_key)
+                .unwrap()
+                .1,
+            2
+        );
+
+        // assert that non_existing_delegatee should not exists on the governance_set
+        assert!(!new_state_governance_set
+            .iter()
+            .any(|v| v.0 == non_existing_delegatee.public_key));
+
+        // make sure expelled members are not part of the governance or validator sets
+        assert!(!new_state_governance_set
+            .iter()
+            .any(|v| v.0 == keys[1].0 || v.0 == keys[4].0));
     }
 
     #[test]
@@ -580,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_delegate_on_consensus_failure() {
+    fn test_apply_delegate_on_consensus_failure1() {
         let (mut state, keys) = generate_standard_genesis(1);
 
         let delegator = state.members[0].clone();
@@ -603,6 +913,37 @@ mod tests {
 
         if new_state.is_ok() {
             panic!("it must fail when the delegator and the delegatee are the same");
+        }
+    }
+
+    #[test]
+    fn test_apply_delegate_on_consensus_failure2() {
+        let (mut state, keys) = generate_standard_genesis(4);
+
+        state.members[0] = create_expelled_member(keys.clone(), 0);
+
+        // delegator: member-0000, delegatee: member-0002
+        let delegator = state.members[0].clone();
+        let delegator_private_key = keys[0].1.clone();
+        let delegatee = state.members[2].clone();
+
+        let data = DelegationTransactionData {
+            // delegator and delegatee are the same
+            delegator: delegator.name,
+            delegatee: delegatee.name,
+            governance: false,
+            block_height: 0,
+            timestamp: 0,
+            chain_name: state.genesis_info.chain_name.clone(),
+        };
+        let proof = TypedSignature::sign(&data, &delegator_private_key).unwrap();
+
+        let tx = TxDelegate { data, proof };
+
+        let new_state = state.apply_delegate(&tx);
+
+        if new_state.is_ok() {
+            panic!("it must fail when the delegator is expelled");
         }
     }
 
@@ -712,5 +1053,33 @@ mod tests {
                 .1,
             1
         );
+    }
+
+    #[test]
+    fn test_apply_undelegate_on_consensus_failure() {
+        let (mut state, keys) = generate_standard_genesis(4);
+
+        state.members[0] = create_expelled_member(keys.clone(), 0);
+
+        // delegator: member-0000
+        let delegator = state.members[0].clone();
+        let delegator_private_key = keys[0].1.clone();
+
+        let data = UndelegationTransactionData {
+            // delegator and delegatee are the same
+            delegator: delegator.name,
+            block_height: 0,
+            timestamp: 0,
+            chain_name: state.genesis_info.chain_name.clone(),
+        };
+        let proof = TypedSignature::sign(&data, &delegator_private_key).unwrap();
+
+        let tx = TxUndelegate { data, proof };
+
+        let new_state = state.apply_undelegate(&tx);
+
+        if new_state.is_ok() {
+            panic!("it must fail when the delegator is expelled");
+        }
     }
 }

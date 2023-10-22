@@ -53,18 +53,32 @@ impl Client {
     }
 
     pub async fn open(path: &str, config: types::Config, auth: Auth) -> Result<Self> {
-        let (governance_dms, consensus_dms, consensus_state, repository, peers) =
+        let (governance_dms, consensus_dms, consensus_state, repository_dms, peers) =
             storage::open(path, config.clone(), auth.clone()).await?;
-        let lfi = repository.read_last_finalization_info().await?;
+        let repository = DistributedRepository::new(
+            Some(Arc::new(RwLock::new(repository_dms))),
+            Arc::new(RwLock::new(RawRepository::open(path).await?)),
+            simperby_repository::Config {
+                long_range_attack_distance: 3,
+            },
+            Some(auth.private_key.clone()),
+        )
+        .await?;
 
+        let lfi = repository.read_last_finalization_info().await?;
+        let agendas = repository.read_agendas().await?;
         Ok(Self {
             inner: Some(ClientInner {
                 config,
                 auth: auth.clone(),
                 path: path.to_string(),
                 repository,
-                governance: Governance::new(Arc::new(RwLock::new(governance_dms)), lfi.clone())
-                    .await?,
+                governance: Governance::new(
+                    Arc::new(RwLock::new(governance_dms)),
+                    lfi.clone(),
+                    agendas.into_iter().map(|(_, hash)| hash).collect(),
+                )
+                .await?,
                 consensus: Consensus::new(
                     Arc::new(RwLock::new(consensus_dms)),
                     consensus_state,
@@ -126,10 +140,15 @@ impl Client {
                 let path = this.path.clone();
                 let config = this.config.clone();
                 let auth = this.auth.clone();
+                let peers = this.peers.list_peers().await?;
                 drop(this);
                 storage::clear(&path).await?;
                 storage::init(&path).await?;
-                self.inner = Some(Self::open(&path, config, auth).await?.inner.unwrap());
+                let mut this = Self::open(&path, config, auth).await?.inner.unwrap();
+                for peer in peers {
+                    this.peers.add_peer(peer.name, peer.address).await?;
+                }
+                self.inner = Some(this);
                 return Ok(report);
             }
         }
@@ -249,6 +268,13 @@ impl Client {
             .await?;
         this.repository.sync_all().await?;
 
+        let agendas = this.repository.read_agendas().await?;
+        for (_, agenda_hash) in agendas {
+            this.governance
+                .register_verified_agenda_hash(agenda_hash)
+                .await?;
+        }
+
         // Update governance
         this.governance.update().await?;
         for (agenda_hash, agenda_proof) in this.governance.get_eligible_agendas().await? {
@@ -314,12 +340,14 @@ impl Client {
                 continue;
             };
             let url = format!("git://{}:{port}/", peer.address.ip());
-            this.repository
+            // TODO: skip only "already exists" error
+            let _ = this
+                .repository
                 .get_raw()
                 .write()
                 .await
                 .add_remote(peer.name.clone(), url)
-                .await?;
+                .await;
         }
         Ok(())
     }

@@ -81,6 +81,54 @@ pub async fn read_last_finalization_proof(
     }
 }
 
+pub async fn read_finalization_info(
+    raw: &RawRepository,
+    height: BlockHeight,
+) -> Result<FinalizationInfo, Error> {
+    let finalized_block_header = read_last_finalized_block_header(raw).await?;
+    let last_block_height = finalized_block_header.height;
+
+    if height == last_block_height {
+        read_last_finalization_info(raw).await
+    } else {
+        let initial_commit = raw.get_initial_commit().await?;
+        let finalized_commit_hash = get_last_finalized_block_commit_hash(raw).await?;
+
+        let commits = raw
+            .query_commit_path(initial_commit, finalized_commit_hash)
+            .await?;
+        let commits = stream::iter(
+            commits
+                .iter()
+                .cloned()
+                .map(|c| async move { raw.read_semantic_commit(c).await.map(|x| (x, c)) }),
+        )
+        .buffered(256)
+        .collect::<Vec<_>>()
+        .await;
+        let commits = commits.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let commits = commits
+            .into_iter()
+            .filter(|(commit, _hash)| {
+                commit.title == format!(">block: {height}")
+                    || commit.title == format!(">block: {}", height + 1)
+            })
+            .collect::<Vec<_>>();
+
+        let header: BlockHeader = serde_spb::from_str(&commits[0].0.body)?;
+        let next_header: BlockHeader = serde_spb::from_str(&commits[1].0.body)?;
+        let commit_hash = commits[0].1;
+        let reserved_state = raw.read_reserved_state_at_commit(commit_hash).await?;
+        let proof = next_header.prev_block_finalization_proof;
+        Ok(FinalizationInfo {
+            header,
+            commit_hash,
+            reserved_state,
+            proof,
+        })
+    }
+}
+
 pub async fn read_last_finalization_info(raw: &RawRepository) -> Result<FinalizationInfo, Error> {
     let header = read_last_finalized_block_header(raw).await?;
     let commit_hash = get_last_finalized_block_commit_hash(raw).await?;
@@ -94,7 +142,26 @@ pub async fn read_last_finalization_info(raw: &RawRepository) -> Result<Finaliza
     })
 }
 
-pub async fn read_commits(
+pub(crate) async fn read_raw_commits(
+    raw: &RawRepository,
+    ancestor: CommitHash,
+    descendant: CommitHash,
+) -> Result<Vec<(RawCommit, CommitHash)>, Error> {
+    let commits = raw.query_commit_path(ancestor, descendant).await?;
+    let commits = stream::iter(
+        commits
+            .iter()
+            .cloned()
+            .map(|c| async move { raw.read_commit(c).await.map(|x| (x, c)) }),
+    )
+    .buffered(256)
+    .collect::<Vec<_>>()
+    .await;
+    let commits = commits.into_iter().collect::<Result<Vec<_>, _>>()?;
+    Ok(commits)
+}
+
+pub(crate) async fn read_commits(
     raw: &RawRepository,
     ancestor: CommitHash,
     descendant: CommitHash,
@@ -248,10 +315,6 @@ pub async fn read_governance_approved_agendas(
                     if agenda_proof.height == last_header.height + 1 {
                         agendas.push((hash, agenda_proof.to_hash256()));
                     }
-
-                    let agenda_commit_hash = raw.list_ancestors(hash, Some(1)).await?[0];
-
-                    agendas.push((agenda_commit_hash, agenda_proof.agenda_hash));
                 }
             }
         }

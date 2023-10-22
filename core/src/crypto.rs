@@ -489,7 +489,23 @@ mod tests {
         assert_eq!(hash.to_string().len(), 64);
         let encoded = serde_spb::to_string(&hash).unwrap();
         assert_eq!(encoded.len(), 66);
-        let (public_key, private_key) = generate_keypair("hello world");
+        let (public_key, private_key) = generate_keypair("hello rustaceans");
+        let signature = Signature::sign(hash, &private_key).unwrap();
+        let encoded = serde_spb::to_string(&signature).unwrap();
+        assert_eq!(encoded.len(), 132);
+        let encoded = serde_spb::to_string(&public_key).unwrap();
+        assert_eq!(encoded.len(), 132);
+        let encoded = serde_spb::to_string(&private_key).unwrap();
+        assert_eq!(encoded.len(), 66);
+    }
+
+    #[test]
+    fn pretty_format2() {
+        let hash = Hash256::zero();
+        assert_eq!(hash.to_string().len(), 64);
+        let encoded = serde_spb::to_string(&hash).unwrap();
+        assert_eq!(encoded.len(), 66);
+        let (public_key, private_key) = generate_keypair_random();
         let signature = Signature::sign(hash, &private_key).unwrap();
         let encoded = serde_spb::to_string(&signature).unwrap();
         assert_eq!(encoded.len(), 132);

@@ -2,23 +2,26 @@ pub mod format;
 pub mod interpret;
 pub mod raw;
 // TODO: integrate the server feature with `DistributedRepository`
+mod network;
 pub mod server;
 
 use eyre::eyre;
 use format::*;
 use futures::prelude::*;
 use interpret::*;
-use log::info;
 use raw::{RawCommit, RawRepository};
 use serde::{Deserialize, Serialize};
 use simperby_core::reserved::ReservedState;
 use simperby_core::utils::get_timestamp;
 use simperby_core::verify::CommitSequenceVerifier;
 use simperby_core::*;
+use simperby_network::*;
 use std::sync::Arc;
 use std::{collections::HashSet, fmt};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
+
+pub use network::RepositoryMessage;
 
 pub type Branch = String;
 pub type Tag = String;
@@ -61,6 +64,7 @@ pub struct Config {
 /// - It **verifies** all the incoming changes and applies them to the local repository
 /// only if they are valid.
 pub struct DistributedRepository {
+    dms: Option<Arc<RwLock<Dms<RepositoryMessage>>>>,
     /// We keep the `RawRepository` in a `RwLock` for possible concurrent accesses in some operations.
     raw: Arc<RwLock<RawRepository>>,
     _config: Config,
@@ -72,12 +76,18 @@ impl DistributedRepository {
         Arc::clone(&self.raw)
     }
 
+    pub fn get_dms(&self) -> Option<Arc<RwLock<Dms<RepositoryMessage>>>> {
+        self.dms.as_ref().map(Arc::clone)
+    }
+
     pub async fn new(
+        dms: Option<Arc<RwLock<Dms<RepositoryMessage>>>>,
         raw: Arc<RwLock<RawRepository>>,
         config: Config,
         private_key: Option<PrivateKey>,
     ) -> Result<Self, Error> {
         Ok(Self {
+            dms,
             raw,
             _config: config,
             private_key,
@@ -107,9 +117,9 @@ impl DistributedRepository {
     /// Reads the finalization information at specific height.
     pub async fn read_finalization_info(
         &self,
-        _height: BlockHeight,
+        height: BlockHeight,
     ) -> Result<FinalizationInfo, Error> {
-        todo!()
+        read_finalization_info(&*self.raw.read().await, height).await
     }
 
     /// Reads the given commit.
@@ -230,11 +240,15 @@ impl DistributedRepository {
     // ---------------
 
     pub async fn flush(&mut self) -> Result<(), Error> {
-        todo!()
+        self.flush_().await
     }
 
+    /// Updates the repository module with the latest messages from the DMS.
+    ///
+    /// Note that it never finalizes a block.
+    /// Finalization is done by the consensus module, or the `sync` method.
     pub async fn update(&mut self, _no_network: bool) -> Result<(), Error> {
-        todo!()
+        self.update_().await
     }
 
     // ---------------
@@ -254,6 +268,14 @@ impl DistributedRepository {
         timestamp: Timestamp,
     ) -> Result<CommitHash, Error> {
         approve(&mut *self.raw.write().await, agenda_hash, proof, timestamp).await
+    }
+
+    /// Creates a transaction commit on top of the HEAD.
+    pub async fn create_transaction(
+        &mut self,
+        transaction: Transaction,
+    ) -> Result<CommitHash, Error> {
+        create_transaction(&mut *self.raw.write().await, transaction).await
     }
 
     /// Creates an agenda commit on top of the HEAD.

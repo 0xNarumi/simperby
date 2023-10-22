@@ -1,7 +1,7 @@
 use super::*;
 use read::*;
 
-async fn advance_finalized_branch(
+pub(crate) async fn advance_finalized_branch(
     raw: &mut RawRepository,
     to_be_finalized_block_commit_hash: CommitHash,
     finalization_proof: LastFinalizationProof,
@@ -15,7 +15,9 @@ async fn advance_finalized_branch(
     raw.move_branch(FP_BRANCH_NAME.into(), to_be_finalized_block_commit_hash)
         .await?;
     raw.checkout(FP_BRANCH_NAME.into()).await?;
-    raw.create_semantic_commit(format::fp_to_semantic_commit(&finalization_proof))
+    raw.create_semantic_commit(format::fp_to_semantic_commit(&finalization_proof), true)
+        .await?;
+    raw.checkout_detach(to_be_finalized_block_commit_hash)
         .await?;
     Ok(())
 }
@@ -133,7 +135,6 @@ pub async fn sync(
         {
             Commit::Agenda(agenda) => {
                 let approved_agendas = read::read_governance_approved_agendas(raw).await?;
-
                 for (commit_hash, _) in approved_agendas {
                     if let Commit::AgendaProof(agenda_proof) =
                         read::read_commit(raw, commit_hash).await?
@@ -281,88 +282,5 @@ pub async fn clean(raw: &mut RawRepository, hard: bool) -> Result<(), Error> {
         raw.remove_remote(remote_name).await?;
     }
 
-    Ok(())
-}
-
-pub async fn sync_old(
-    raw: &mut RawRepository,
-    block_hash: &Hash256,
-    last_block_proof: &FinalizationProof,
-) -> Result<(), Error> {
-    let block_branch_name = format!("b-{}", &block_hash.to_string()[0..BRANCH_NAME_HASH_DIGITS]);
-    let block_commit_hash = raw.locate_branch(block_branch_name.clone()).await?;
-
-    if block_commit_hash == raw.locate_branch(FINALIZED_BRANCH_NAME.to_owned()).await? {
-        info!("already finalized");
-        return Ok(());
-    }
-
-    // Check if the last commit is a block commit.
-    let current_finalized_commit = raw.locate_branch(FINALIZED_BRANCH_NAME.into()).await?;
-    let new_commits = read_commits(raw, current_finalized_commit, block_commit_hash).await?;
-    let last_block_header = if let Commit::Block(last_block_header) = &new_commits.last().unwrap().0
-    {
-        last_block_header
-    } else {
-        return Err(eyre!("the last commit is not a block commit"));
-    };
-
-    // Check if the given block commit is a descendant of the current finalized branch
-
-    let find_merge_base_result = raw
-        .find_merge_base(current_finalized_commit, block_commit_hash)
-        .await
-        .map_err(|e| match e {
-            raw::Error::NotFound(_) => {
-                eyre!(IntegrityError::new(format!(
-                    "cannot find merge base for branch {block_branch_name} and finalized branch"
-                )))
-            }
-            _ => eyre!(e),
-        })?;
-    if current_finalized_commit != find_merge_base_result {
-        return Err(eyre!(
-            "block commit is not a descendant of the current finalized branch"
-        ));
-    }
-
-    // Verify every commit along the way.
-    let last_finalized_block_header = read_last_finalized_block_header(raw).await?;
-    let reserved_state = read_last_finalized_reserved_state(raw).await?;
-    let mut verifier =
-        CommitSequenceVerifier::new(last_finalized_block_header.clone(), reserved_state.clone())
-            .map_err(|e| eyre!("failed to create a commit sequence verifier: {}", e))?;
-    for (new_commit, new_commit_hash) in &new_commits {
-        verifier
-            .apply_commit(new_commit)
-            .map_err(|e| eyre!("verification error on commit {}: {}", new_commit_hash, e))?;
-    }
-    verifier
-        .verify_last_header_finalization(last_block_proof)
-        .map_err(|e| eyre!("verification error on the last block header: {}", e))?;
-
-    // If commit sequence verification is done and the finalization proof is verified,
-    // move the `finalized` branch to the given block commit hash.
-    // Then we update the `fp` branch.
-    raw.checkout_clean().await?;
-    raw.move_branch(FINALIZED_BRANCH_NAME.to_string(), block_commit_hash)
-        .await?;
-    raw.move_branch(FP_BRANCH_NAME.to_string(), block_commit_hash)
-        .await?;
-    raw.checkout(FP_BRANCH_NAME.into())
-        .await
-        .map_err(|e| match e {
-            raw::Error::NotFound(_) => {
-                eyre!(IntegrityError::new(format!(
-                    "failed to checkout to the fp branch: {e}"
-                )))
-            }
-            _ => eyre!(e),
-        })?;
-    raw.create_semantic_commit(format::fp_to_semantic_commit(&LastFinalizationProof {
-        height: last_block_header.height,
-        proof: last_block_proof.clone(),
-    }))
-    .await?;
     Ok(())
 }
